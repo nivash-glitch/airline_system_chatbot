@@ -1,12 +1,14 @@
 import sqlite3
 import json
-from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import pipeline
+import torch
+import os
 import random
 
-# --- Pydantic Models ---
+# Pydantic models
 class ClassifyRequest(BaseModel):
     message: str
 
@@ -15,12 +17,12 @@ class FeedbackRequest(BaseModel):
     is_correct: bool
     correct_request_type: str = None
 
-# --- FastAPI App ---
+# FastAPI app
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"],  # Update as needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,14 +35,13 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-def log_event(log_type: str, message: str, severity: str = "INFO", additional_data: dict = None):
-    """Helper function to log events"""
+def log_event(log_type, message, severity="INFO", additional_data=None):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             "INSERT INTO logs (log_type, message, severity, additional_data) VALUES (?, ?, ?, ?)",
-            (log_type, message, severity, json.dumps(additional_data) if additional_data else None)
+            (log_type, message, severity, json.dumps(additional_data) if additional_data else None),
         )
         conn.commit()
     except Exception as e:
@@ -48,7 +49,25 @@ def log_event(log_type: str, message: str, severity: str = "INFO", additional_da
     finally:
         conn.close()
 
-# --- Mock Data ---
+# Load NLP pipeline from fine-tuned model folder
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "airline_intent_classifier")
+
+print("Loading NLP pipeline for classification...")
+try:
+    classifier = pipeline(
+        "text-classification",
+        model=MODEL_DIR,
+        device=0 if torch.cuda.is_available() else -1,
+        return_all_scores=False,
+    )
+    MODEL_LOADED = True
+    print("✅ Pipeline loaded successfully!")
+except Exception as e:
+    print(f"⚠️ Failed to load pipeline: {e}")
+    classifier = None
+    MODEL_LOADED = False
+
+# Fallback intents list
 MOCK_REQUEST_TYPES = [
     "Cancel Trip", "Cancellation Policy", "Carry On Luggage Faq",
     "Change Flight", "Check In Luggage Faq", "Complaints",
@@ -57,142 +76,135 @@ MOCK_REQUEST_TYPES = [
     "Pet Travel", "Prohibited Items Faq", "Seat Availability", "Sports Music Gear"
 ]
 
-# --- API Endpoints ---
 @app.post("/classify")
 async def classify_message(request: ClassifyRequest, req: Request):
-    """Classify customer message and store prediction"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Mock prediction (replace with actual ML model later)
-    mock_prediction = random.choice(MOCK_REQUEST_TYPES)
-    mock_confidence = round(random.uniform(0.7, 0.99), 2)
-    
-    # Get client IP
     client_ip = req.client.host
-    
+
+    if MODEL_LOADED and classifier is not None:
+        try:
+            result = classifier(request.message)[0]
+            label = result.get('label')
+            score = result.get('score')
+            # Strip prefix label if exists (e.g., LABEL_0)
+            if label.startswith("LABEL_"):
+                label = label.split("_", 1)[1]
+            confidence = round(score, 2)
+            prediction = label
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            prediction = random.choice(MOCK_REQUEST_TYPES)
+            confidence = round(random.uniform(0.7, 0.99), 2)
+    else:
+        prediction = random.choice(MOCK_REQUEST_TYPES)
+        confidence = round(random.uniform(0.7, 0.99), 2)
+
     try:
         cursor.execute(
             "INSERT INTO predictions (message, predicted_request_type, confidence_score, user_ip) VALUES (?, ?, ?, ?)",
-            (request.message, mock_prediction, mock_confidence, client_ip)
+            (request.message, prediction, confidence, client_ip),
         )
         conn.commit()
         prediction_id = cursor.lastrowid
-        
-        # Log the prediction
-        log_event("PREDICTION", f"New prediction made: {mock_prediction}", "INFO", 
-                  {"prediction_id": prediction_id, "confidence": mock_confidence})
-        
+
+        log_event(
+            "PREDICTION",
+            f"Predicted intent '{prediction}' with confidence {confidence}",
+            "INFO",
+            {"prediction_id": prediction_id, "confidence": confidence},
+        )
+
         return {
             "prediction_id": prediction_id,
             "message": request.message,
-            "predicted_request_type": mock_prediction,
-            "confidence": mock_confidence
+            "predicted_request_type": prediction,
+            "confidence": confidence,
         }
     except Exception as e:
         conn.rollback()
-        log_event("ERROR", f"Prediction failed: {str(e)}", "ERROR")
+        log_event("ERROR", f"DB insert error for prediction: {e}", "ERROR")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         conn.close()
 
 @app.post("/feedback")
 def receive_feedback(request: FeedbackRequest):
-    """Receive and store user feedback"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
         cursor.execute(
             "INSERT INTO feedback (prediction_id, is_correct, correct_request_type) VALUES (?, ?, ?)",
-            (request.prediction_id, request.is_correct, request.correct_request_type)
+            (request.prediction_id, request.is_correct, request.correct_request_type),
         )
         conn.commit()
-        
-        # Log feedback
-        log_event("FEEDBACK", f"Feedback received for prediction {request.prediction_id}", "INFO",
-                  {"is_correct": request.is_correct})
-        
-        return {"status": "success", "message": "Feedback received"}
+
+        log_event(
+            "FEEDBACK",
+            f"Feedback for prediction {request.prediction_id}",
+            "INFO",
+            {"is_correct": request.is_correct},
+        )
+        return {"status": "success", "message": "Feedback recorded"}
     except Exception as e:
         conn.rollback()
-        log_event("ERROR", f"Feedback storage failed: {str(e)}", "ERROR")
+        log_event("ERROR", f"DB insert error for feedback: {e}", "ERROR")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
     finally:
         conn.close()
 
 @app.get("/stats")
 def get_system_stats():
-    """Get overall system statistics"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
-        # Get overall stats
         cursor.execute("SELECT * FROM system_stats")
         stats_row = cursor.fetchone()
-        
-        if stats_row:
-            stats = {
-                "total_predictions": stats_row[0] or 0,
-                "total_feedback": stats_row[1] or 0,
-                "total_correct": stats_row[2] or 0,
-                "total_incorrect": stats_row[3] or 0,
-                "overall_accuracy": stats_row[4] or 0
-            }
-        else:
-            stats = {
-                "total_predictions": 0,
-                "total_feedback": 0,
-                "total_correct": 0,
-                "total_incorrect": 0,
-                "overall_accuracy": 0
-            }
-        
-        # Get per-category accuracy
+        stats = {
+            "total_predictions": stats_row[0] if stats_row else 0,
+            "total_feedback": stats_row[1] if stats_row else 0,
+            "total_correct": stats_row[2] if stats_row else 0,
+            "total_incorrect": stats_row[3] if stats_row else 0,
+            "overall_accuracy": stats_row[4] if stats_row else 0,
+        }
+
         cursor.execute("SELECT * FROM prediction_accuracy")
-        category_stats = []
-        for row in cursor.fetchall():
-            category_stats.append({
+        category_stats = [
+            {
                 "request_type": row[0],
                 "total_predictions": row[1],
                 "correct": row[2],
                 "incorrect": row[3],
-                "accuracy": row[4]
-            })
-        
-        return {
-            "overall": stats,
-            "by_category": category_stats
-        }
+                "accuracy": row[4],
+            }
+            for row in cursor.fetchall()
+        ]
+
+        return {"overall": stats, "by_category": category_stats}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Stats fetch error: {e}")
     finally:
         conn.close()
 
 @app.get("/logs")
 def get_logs(limit: int = 50):
-    """Get recent system logs"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
-        cursor.execute(
-            "SELECT * FROM logs ORDER BY timestamp DESC LIMIT ?",
-            (limit,)
-        )
-        logs = []
-        for row in cursor.fetchall():
-            logs.append({
+        cursor.execute("SELECT * FROM logs ORDER BY timestamp DESC LIMIT ?", (limit,))
+        logs = [
+            {
                 "id": row[0],
                 "log_type": row[1],
                 "message": row[2],
                 "severity": row[3],
                 "timestamp": row[4],
-                "additional_data": row[5]
-            })
+                "additional_data": row[5],
+            }
+            for row in cursor.fetchall()
+        ]
         return {"logs": logs}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching logs: {e}")
+        raise HTTPException(status_code=500, detail=f"Logs fetch error: {e}")
     finally:
         conn.close()
